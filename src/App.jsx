@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
-import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from "recharts";
+import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip, LineChart, Line, XAxis, YAxis, CartesianGrid } from "recharts";
 import { Plus, Trash2, RefreshCw, TrendingUp, TrendingDown, Wallet, Settings, Key } from "lucide-react";
 
 const COIN_CATALOG = [
@@ -78,6 +78,100 @@ async function searchByContract(address, apiKey) {
 const EXCHANGES = ["Binance", "BtcTurk", "Paribu", "MEXC", "Bybit", "OKX", "Coinbase"];
 const CUSTOM_EXCHANGE = "__custom__";
 
+// --- Daily buy/sell suggestion (technical, rule-based — not financial advice) ---
+
+function calcRSI(closes, period = 14) {
+  if (closes.length < period + 1) return null;
+  let gains = 0;
+  let losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff >= 0) gains += diff;
+    else losses -= diff;
+  }
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+  for (let i = period + 1; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    const gain = diff > 0 ? diff : 0;
+    const loss = diff < 0 ? -diff : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+  }
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - 100 / (1 + rs);
+}
+
+function sma(closes, period) {
+  if (closes.length < period) return null;
+  const slice = closes.slice(closes.length - period);
+  return slice.reduce((a, b) => a + b, 0) / period;
+}
+
+async function fetchDailyCloses(coinId, apiKey) {
+  const url = cgUrl(
+    `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=30&interval=daily`,
+    apiKey
+  );
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("history fetch failed");
+  const data = await res.json();
+  return (data.prices || []).map((p) => p[1]);
+}
+
+function computeSignal(closes, change24h) {
+  if (!closes || closes.length < 8) return null;
+  const rsi = calcRSI(closes, 14);
+  const maShort = sma(closes, 7);
+  const maLong = sma(closes, Math.min(25, closes.length - 1));
+  const last = closes[closes.length - 1];
+  const weekAgo = closes[Math.max(0, closes.length - 8)];
+  const change7d = weekAgo ? ((last - weekAgo) / weekAgo) * 100 : null;
+
+  let score = 0;
+  const reasons = [];
+
+  if (rsi != null) {
+    if (rsi < 30) {
+      score += 1;
+      reasons.push(`RSI ${rsi.toFixed(0)} — aşırı satım bölgesinde`);
+    } else if (rsi > 70) {
+      score -= 1;
+      reasons.push(`RSI ${rsi.toFixed(0)} — aşırı alım bölgesinde`);
+    } else {
+      reasons.push(`RSI ${rsi.toFixed(0)} — nötr bölge`);
+    }
+  }
+
+  if (maShort != null && maLong != null) {
+    if (maShort > maLong) {
+      score += 1;
+      reasons.push("7 günlük ortalama 25 günlüğün üzerinde — kısa vadeli momentum yukarı");
+    } else {
+      score -= 1;
+      reasons.push("7 günlük ortalama 25 günlüğün altında — kısa vadeli momentum aşağı");
+    }
+  }
+
+  if (change7d != null) {
+    if (change7d > 5) score += 0.5;
+    else if (change7d < -5) score -= 0.5;
+  }
+  if (change24h != null) {
+    if (change24h > 3) score += 0.5;
+    else if (change24h < -3) score -= 0.5;
+  }
+
+  let suggestion = "BEKLE";
+  if (score >= 1.5) suggestion = "AL";
+  else if (score <= -1.5) suggestion = "SAT";
+
+  return { suggestion, score, rsi, maShort, maLong, change7d, reasons };
+}
+
+const SIGNAL_COLORS = { AL: "var(--teal)", SAT: "var(--coral)", BEKLE: "var(--muted)" };
+
 const FALLBACK_COLORS = ["#E8A33D", "#2DD4BF", "#7C9CF0", "#F2A65A", "#8CE0D0", "#5B8DEF", "#C792EA", "#F28FAD", "#A3E635", "#8A93A6"];
 
 const EXCHANGE_COLORS = {
@@ -130,6 +224,9 @@ export default function PortfolioTracker() {
   const [tickersLoading, setTickersLoading] = useState(false);
   const [tickersError, setTickersError] = useState(null);
   const [searchNotice, setSearchNotice] = useState(null);
+  const [valueHistory, setValueHistory] = useState([]);
+  const [signals, setSignals] = useState({});
+  const [signalsLoading, setSignalsLoading] = useState(false);
 
   // load persisted holdings + api key (localStorage — this runs as a real website, not a Claude artifact)
   useEffect(() => {
@@ -282,6 +379,57 @@ export default function PortfolioTracker() {
     [holdings]
   );
 
+  const coinIdsKey = uniqueCoinIds.join(",");
+
+  // daily buy/sell suggestion per held coin (cached once per day per coin)
+  useEffect(() => {
+    if (!loaded || uniqueCoinIds.length === 0) return;
+    const todayKey = new Date().toISOString().slice(0, 10);
+    let cache = {};
+    try {
+      cache = JSON.parse(localStorage.getItem("signals_cache") || "{}");
+    } catch (e) {
+      cache = {};
+    }
+
+    const needsFetch = uniqueCoinIds.filter((id) => !cache[id] || cache[id].date !== todayKey);
+    // show whatever we already have (from cache) immediately
+    setSignals((prev) => ({ ...prev, ...cache }));
+    if (needsFetch.length === 0) return;
+
+    let cancelled = false;
+    (async () => {
+      setSignalsLoading(true);
+      const updates = {};
+      for (const coinId of needsFetch) {
+        try {
+          const closes = await fetchDailyCloses(coinId, apiKey);
+          const change24hForCoin = prices[coinId]?.usd_24h_change ?? null;
+          const sig = computeSignal(closes, change24hForCoin);
+          if (sig) updates[coinId] = { ...sig, date: todayKey };
+        } catch (e) {
+          // skip this coin for today, keep old cached value if any
+        }
+      }
+      if (cancelled) return;
+      setSignals((prev) => {
+        const next = { ...prev, ...updates };
+        try {
+          localStorage.setItem("signals_cache", JSON.stringify(next));
+        } catch (e) {
+          // storage full or unavailable
+        }
+        return next;
+      });
+      setSignalsLoading(false);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [coinIdsKey, loaded, apiKey]);
+
   const fetchPrices = useCallback(async () => {
     if (uniqueCoinIds.length === 0) {
       setPrices({});
@@ -375,6 +523,63 @@ export default function PortfolioTracker() {
   }, [enriched]);
   const totalPnl = totalCost > 0 ? totalValue - totalCost : null;
   const totalPnlPct = totalCost > 0 ? (totalPnl / totalCost) * 100 : null;
+
+  // --- 7-day value history ---
+  const todayKey = new Date().toISOString().slice(0, 10);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("value_history");
+      if (raw) setValueHistory(JSON.parse(raw));
+    } catch (e) {
+      // no saved history yet
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!loaded || totalValue <= 0) return;
+    setValueHistory((prev) => {
+      const idx = prev.findIndex((h) => h.date === todayKey);
+      let next;
+      if (idx >= 0) {
+        next = [...prev];
+        next[idx] = { date: todayKey, value: totalValue };
+      } else {
+        next = [...prev, { date: todayKey, value: totalValue }];
+      }
+      next.sort((a, b) => a.date.localeCompare(b.date));
+      if (next.length > 7) next = next.slice(next.length - 7);
+      return next;
+    });
+  }, [totalValue, loaded, todayKey]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem("value_history", JSON.stringify(valueHistory));
+    } catch (e) {
+      // storage full or unavailable
+    }
+  }, [valueHistory, loaded]);
+
+  const dayLabel = (dateStr) => {
+    const d = new Date(dateStr + "T00:00:00");
+    const names = ["Paz", "Pzt", "Sal", "Çar", "Per", "Cum", "Cmt"];
+    return names[d.getDay()];
+  };
+
+  const historyChartData = useMemo(
+    () => valueHistory.map((h) => ({ label: dayLabel(h.date), value: h.value, date: h.date })),
+    [valueHistory]
+  );
+
+  const weeklyChange = useMemo(() => {
+    if (valueHistory.length < 2) return null;
+    const first = valueHistory[0].value;
+    const last = valueHistory[valueHistory.length - 1].value;
+    if (first === 0) return null;
+    return { diff: last - first, pct: ((last - first) / first) * 100 };
+  }, [valueHistory]);
 
   const byExchange = useMemo(() => {
     const map = {};
@@ -879,7 +1084,27 @@ export default function PortfolioTracker() {
                       <tbody>
                         {items.map((h) => (
                           <tr className="pf-row" key={h.rid} style={{ borderBottom: "1px solid var(--line)" }}>
-                            <td style={{ padding: "10px 16px", fontWeight: 600 }}>{h.symbol}</td>
+                            <td style={{ padding: "10px 16px", fontWeight: 600 }}>
+                              <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                                {h.symbol}
+                                {signals[h.coinId] && (
+                                  <span
+                                    className="pf-mono"
+                                    title={signals[h.coinId].reasons?.join(" · ")}
+                                    style={{
+                                      fontSize: 10,
+                                      fontWeight: 700,
+                                      color: SIGNAL_COLORS[signals[h.coinId].suggestion],
+                                      border: `1px solid ${SIGNAL_COLORS[signals[h.coinId].suggestion]}`,
+                                      borderRadius: 4,
+                                      padding: "1px 5px",
+                                    }}
+                                  >
+                                    {signals[h.coinId].suggestion}
+                                  </span>
+                                )}
+                              </span>
+                            </td>
                             <td style={{ padding: "10px 8px", color: "var(--muted)" }} className="pf-mono">
                               {h.amount}
                             </td>
@@ -977,9 +1202,132 @@ export default function PortfolioTracker() {
                 ))}
               </div>
             </div>
+
+            {/* 7-day value history */}
+            <div className="pf-card" style={{ padding: 18 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8, color: "var(--muted)" }}>
+                SON 7 GÜN
+              </div>
+              {historyChartData.length >= 2 ? (
+                <>
+                  <div style={{ width: "100%", height: 160 }}>
+                    <ResponsiveContainer>
+                      <LineChart data={historyChartData}>
+                        <CartesianGrid stroke="var(--line)" strokeDasharray="3 3" vertical={false} />
+                        <XAxis
+                          dataKey="label"
+                          stroke="var(--muted)"
+                          fontSize={11}
+                          tickLine={false}
+                          axisLine={false}
+                        />
+                        <YAxis hide domain={["auto", "auto"]} />
+                        <Tooltip
+                          formatter={(v) => fmtUSD(v)}
+                          labelFormatter={(_, payload) => payload?.[0]?.payload?.date || ""}
+                          contentStyle={{
+                            background: "var(--surface-hi)",
+                            border: "1px solid var(--line)",
+                            borderRadius: 8,
+                            color: "var(--text)",
+                            fontSize: 12,
+                          }}
+                        />
+                        <Line
+                          type="monotone"
+                          dataKey="value"
+                          stroke="var(--amber)"
+                          strokeWidth={2}
+                          dot={{ r: 3, fill: "var(--amber)" }}
+                          activeDot={{ r: 5 }}
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                  {weeklyChange && (
+                    <div
+                      className="pf-mono"
+                      style={{
+                        marginTop: 6,
+                        fontSize: 13,
+                        color: weeklyChange.diff >= 0 ? "var(--teal)" : "var(--coral)",
+                      }}
+                    >
+                      {weeklyChange.diff >= 0 ? "▲" : "▼"} {fmtUSD(Math.abs(weeklyChange.diff))} (
+                      {fmtPct(weeklyChange.pct)}) bu hafta
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div style={{ fontSize: 13, color: "var(--muted)" }}>
+                  Birkaç gün daha kullandıkça burada haftalık değer grafiğin oluşacak.
+                </div>
+              )}
+            </div>
+
+            {/* Daily buy/sell suggestions — technical, not financial advice */}
+            <div className="pf-card" style={{ padding: 18 }}>
+              <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4, color: "var(--muted)" }}>
+                BUGÜNÜN ÖNERİLERİ {signalsLoading && "(hesaplanıyor…)"}
+              </div>
+              <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 12, lineHeight: 1.5 }}>
+                RSI, hareketli ortalama ve fiyat trendine dayanan otomatik, mekanik bir hesaplama.
+                Yatırım tavsiyesi değildir; piyasa riski her zaman vardır.
+              </div>
+              {Object.keys(byExchange).length === 0 ? (
+                <div style={{ fontSize: 13, color: "var(--muted)" }}>
+                  Coin ekleyince burada günlük öneriler görünecek.
+                </div>
+              ) : (
+                <div style={{ display: "grid", gap: 10 }}>
+                  {[...new Set(holdings.map((h) => h.coinId))].map((coinId) => {
+                    const h = holdings.find((x) => x.coinId === coinId);
+                    const sig = signals[coinId];
+                    return (
+                      <div
+                        key={coinId}
+                        style={{
+                          borderTop: "1px solid var(--line)",
+                          paddingTop: 10,
+                        }}
+                      >
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                          <span style={{ fontWeight: 600, fontSize: 13 }}>{h?.symbol}</span>
+                          {sig ? (
+                            <span
+                              className="pf-mono"
+                              style={{
+                                fontSize: 10,
+                                fontWeight: 700,
+                                color: SIGNAL_COLORS[sig.suggestion],
+                                border: `1px solid ${SIGNAL_COLORS[sig.suggestion]}`,
+                                borderRadius: 4,
+                                padding: "1px 6px",
+                              }}
+                            >
+                              {sig.suggestion}
+                            </span>
+                          ) : (
+                            <span style={{ fontSize: 11, color: "var(--muted)" }}>hesaplanıyor…</span>
+                          )}
+                        </div>
+                        {sig && (
+                          <ul style={{ margin: 0, paddingLeft: 16, fontSize: 12, color: "var(--muted)" }}>
+                            {sig.reasons.map((r, i) => (
+                              <li key={i}>{r}</li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
           </div>
         )}
       </div>
+
 
       <style>{`
         @keyframes spin { to { transform: rotate(360deg); } }
